@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+.env
+.DS_Store
+
+# Research artifacts
+caches/
+checkpoints/
+results/
+outputs/
+data/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.npy
+*.npz
