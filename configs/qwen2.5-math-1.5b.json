@@ -1,0 +1,5 @@
+{
+  "paper_name": "Qwen2.5-Math-1.5B",
+  "hidden_size": 1536,
+  "depths": [14, 21, 28]
+}
