@@ -240,7 +240,7 @@ Example:
 python analysis/mechanism.py \
   --cache caches/test \
   --depths 14 21 28 \
-  --residual-checkpoint checkpoints/residual_seed42.pt \
+  --residual-checkpoints checkpoints/residual_seed42.pt checkpoints/residual_seed123.pt checkpoints/residual_seed456.pt \
   --output results/mechanism.json
 ```
 
