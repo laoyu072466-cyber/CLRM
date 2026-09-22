@@ -1,0 +1,5 @@
+{
+  "paper_name": "Llama-3.2-3B",
+  "hidden_size": 3072,
+  "depths": [14, 21, 28]
+}
