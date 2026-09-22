@@ -44,8 +44,10 @@ def cosine_rows(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 def bootstrap_mean(values: Sequence[float], reps: int = 10_000, seed: int = 2025) -> tuple[float, float, float]:
     values = np.asarray(values, dtype=np.float64)
-    if len(values) < 2:
-        return float(values.mean()), float("nan"), float("nan")
+    if len(values) == 0:
+        return float("nan"), float("nan"), float("nan")
+    if len(values) == 1:
+        return float(values[0]), float("nan"), float("nan")
     rng = np.random.default_rng(seed)
     draws = np.empty(reps, dtype=np.float64)
     for start in range(0, reps, 250):
@@ -67,6 +69,24 @@ def problem_contrasts(rows: Sequence[dict], field: str) -> np.ndarray:
     return np.asarray(out, dtype=np.float64)
 
 
+def residualize_length(rows: Sequence[dict], field: str) -> tuple[list[dict], float]:
+    y = np.asarray([float(r[field]) for r in rows], dtype=np.float64)
+    x = np.log1p(np.asarray([int(r["response_length"]) for r in rows], dtype=np.float64))
+    if len(y) < 2 or np.std(x) == 0 or np.std(y) == 0:
+        corr = float("nan")
+    else:
+        corr = float(np.corrcoef(x, y)[0, 1])
+    X = np.column_stack([np.ones(len(x)), x])
+    beta = np.linalg.lstsq(X, y, rcond=None)[0]
+    residual = y - X @ beta
+    out = []
+    for row, value in zip(rows, residual):
+        item = dict(row)
+        item["_length_residual"] = float(value)
+        out.append(item)
+    return out, corr
+
+
 def _snr_by_problem(vectors: dict[str, list[list[np.ndarray]]]) -> np.ndarray:
     snrs = []
     for neg, pos in vectors.values():
@@ -84,9 +104,7 @@ def _snr_by_problem(vectors: dict[str, list[list[np.ndarray]]]) -> np.ndarray:
     return np.asarray(snrs, dtype=np.float64)
 
 
-def projected_alignment_model(checkpoint: str | None, hidden_size: int, depths: Sequence[int]) -> ResidualOnly | None:
-    if checkpoint is None:
-        return None
+def _load_residual_model(checkpoint: str, hidden_size: int, depths: Sequence[int]) -> ResidualOnly:
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     model = ResidualOnly(hidden_size, depths)
     state = payload.get("model_state_dict", payload.get("head_state_dict"))
@@ -104,12 +122,18 @@ def projected_alignment_model(checkpoint: str | None, hidden_size: int, depths: 
     return model
 
 
-def analyze(cache_dir: str, depths: Sequence[int], checkpoint: str | None = None) -> dict:
+def _position_bins(length: int, bins: int = 5) -> np.ndarray:
+    pos = (np.arange(length, dtype=np.float64) + 0.5) / length
+    return np.minimum((pos * bins).astype(int), bins - 1)
+
+
+def analyze(cache_dir: str, depths: Sequence[int], checkpoints: Sequence[str] | None = None) -> dict:
     data = HiddenStateDataset(cache_dir)
-    e, m, f = [int(x) for x in depths]
     if len(depths) != 3:
         raise ValueError("mechanism analysis expects exactly three depths")
-    proj_model = projected_alignment_model(checkpoint, data.hidden_size, depths)
+    e, m, f = [int(x) for x in depths]
+    checkpoints = list(checkpoints or [])
+    projection_models = [_load_residual_model(p, data.hidden_size, depths) for p in checkpoints]
 
     candidate_rows = []
     state_vectors = {d: defaultdict(lambda: [[], []]) for d in depths}
@@ -121,6 +145,7 @@ def analyze(cache_dir: str, depths: Sequence[int], checkpoint: str | None = None
         h1 = hs[m].numpy()
         h2 = hs[f].numpy()
         m1, m2, coh = geometry(h0, h1, h2)
+        bins = _position_bins(len(h0))
         row = {
             "problem_id": str(meta["problem_id"]),
             "candidate_index": int(meta["candidate_index"]),
@@ -133,16 +158,32 @@ def analyze(cache_dir: str, depths: Sequence[int], checkpoint: str | None = None
             "raw_cos23": float(cosine_rows(h1, h2).mean()),
             "raw_cos13": float(cosine_rows(h0, h2).mean()),
         }
-        if proj_model is not None:
+        for b in range(5):
+            keep = bins == b
+            row[f"bin{b+1}_m1"] = float(m1[keep].mean()) if keep.any() else float("nan")
+            row[f"bin{b+1}_m2"] = float(m2[keep].mean()) if keep.any() else float("nan")
+            row[f"bin{b+1}_coherence"] = float(coh[keep].mean()) if keep.any() else float("nan")
+
+        if projection_models:
+            per_seed = []
             with torch.inference_mode():
-                z0 = proj_model.projected(hs[e]).numpy()
-                z1 = proj_model.projected(hs[m]).numpy()
-                z2 = proj_model.projected(hs[f]).numpy()
+                for model in projection_models:
+                    z0 = model.projected(hs[e]).numpy()
+                    z1 = model.projected(hs[m]).numpy()
+                    z2 = model.projected(hs[f]).numpy()
+                    per_seed.append(
+                        [
+                            float(cosine_rows(z0, z1).mean()),
+                            float(cosine_rows(z1, z2).mean()),
+                            float(cosine_rows(z0, z2).mean()),
+                        ]
+                    )
+            projected = np.asarray(per_seed, dtype=np.float64).mean(axis=0)
             row.update(
                 {
-                    "projected_cos12": float(cosine_rows(z0, z1).mean()),
-                    "projected_cos23": float(cosine_rows(z1, z2).mean()),
-                    "projected_cos13": float(cosine_rows(z0, z2).mean()),
+                    "projected_cos12": float(projected[0]),
+                    "projected_cos23": float(projected[1]),
+                    "projected_cos13": float(projected[2]),
                 }
             )
         candidate_rows.append(row)
@@ -156,18 +197,47 @@ def analyze(cache_dir: str, depths: Sequence[int], checkpoint: str | None = None
 
     summaries = {}
     fields = ["mean_m1", "mean_m2", "mean_coherence", "raw_cos12", "raw_cos23", "raw_cos13"]
-    if checkpoint:
+    if projection_models:
         fields += ["projected_cos12", "projected_cos23", "projected_cos13"]
     for j, field in enumerate(fields):
         effects = problem_contrasts(candidate_rows, field)
-        mean, lo, hi = bootstrap_mean(effects, seed=2025 + j)
-        summaries[field] = {"correct_minus_incorrect": mean, "ci95": [lo, hi], "n_problems": len(effects)}
+        mean, lo, hi = bootstrap_mean(effects, seed=2025 + 2 * j)
+        residualized, length_corr = residualize_length(candidate_rows, field)
+        length_effects = problem_contrasts(residualized, "_length_residual")
+        length_mean, length_lo, length_hi = bootstrap_mean(length_effects, seed=2026 + 2 * j)
+        summaries[field] = {
+            "correct_minus_incorrect": mean,
+            "ci95": [lo, hi],
+            "length_corr": length_corr,
+            "length_residualized_correct_minus_incorrect": length_mean,
+            "length_residualized_ci95": [length_lo, length_hi],
+            "n_problems": len(effects),
+        }
+
+    position_profiles = []
+    counter = 0
+    for b in range(1, 6):
+        for name in ("m1", "m2", "coherence"):
+            field = f"bin{b}_{name}"
+            effects = problem_contrasts(candidate_rows, field)
+            mean, lo, hi = bootstrap_mean(effects, seed=2600 + counter)
+            counter += 1
+            position_profiles.append(
+                {"bin": b, "metric": name, "correct_minus_incorrect": mean, "ci95": [lo, hi], "n_problems": len(effects)}
+            )
 
     state_snr = {}
+    state_means = []
     for j, d in enumerate(depths):
         values = _snr_by_problem(state_vectors[d])
         mean, lo, hi = bootstrap_mean(values, seed=2200 + j)
+        state_means.append(mean)
         state_snr[str(d)] = {"mean": mean, "ci95": [lo, hi], "n_problems": len(values)}
+    state_snr["ratios"] = {
+        "middle_over_early": state_means[1] / state_means[0],
+        "final_over_middle": state_means[2] / state_means[1],
+        "final_over_early": state_means[2] / state_means[0],
+    }
 
     residual_snr = {}
     for j, name in enumerate(("r1", "r2")):
@@ -177,8 +247,10 @@ def analyze(cache_dir: str, depths: Sequence[int], checkpoint: str | None = None
 
     return {
         "depths": list(depths),
+        "projected_alignment_checkpoints": len(projection_models),
         "candidate_rows": candidate_rows,
         "contrasts": summaries,
+        "position_profiles": position_profiles,
         "state_snr": state_snr,
         "residual_snr": residual_snr,
     }
@@ -188,10 +260,15 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--cache", required=True)
     p.add_argument("--depths", nargs=3, type=int, required=True)
-    p.add_argument("--residual-checkpoint", default=None)
+    p.add_argument(
+        "--residual-checkpoints",
+        nargs="*",
+        default=[],
+        help="Frozen Residual-only checkpoints; projected alignment is averaged across them at candidate level.",
+    )
     p.add_argument("--output", required=True)
     args = p.parse_args()
-    result = analyze(args.cache, args.depths, args.residual_checkpoint)
+    result = analyze(args.cache, args.depths, args.residual_checkpoints)
     candidate_rows = result.pop("candidate_rows")
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
